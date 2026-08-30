@@ -9,7 +9,7 @@
 # Optional live market panel:
 #   pip install yfinance
 # Run:
-#   streamlit run us_dollar_system_dashboard.py
+#   streamlit run dollar_system.py
 #
 # Data/cache rule:
 #   All data-loading and model-building helpers use a 5-minute
