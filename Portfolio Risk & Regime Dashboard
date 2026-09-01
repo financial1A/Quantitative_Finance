@@ -1,0 +1,287 @@
+"""
+Portfolio Risk & Regime Dashboard
+----------------------------------
+Institutional-style multi-asset risk analytics: volatility regimes, drawdown,
+VaR/CVaR, Sharpe/Sortino, and cross-asset correlation.
+
+Run: streamlit run market_regime_dashboard.py
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import yfinance as yf
+from datetime import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="Portfolio Risk & Regime Dashboard", layout="wide")
+
+# ============================================================
+# THEME — dark quant-terminal look, not decorative
+# ============================================================
+st.markdown("""
+<style>
+.stApp { background-color: #0e1117; }
+section[data-testid="stSidebar"] { background-color: #131722; }
+section[data-testid="stSidebar"] * { color: #d1d5db !important; }
+[data-testid="stMetricValue"] { font-family: 'Roboto Mono', monospace; }
+h1, h2, h3 { color: #e5e7eb; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📊 Portfolio Risk & Regime Dashboard")
+st.caption("Multi-asset volatility regimes, drawdown, VaR/CVaR, and correlation — for research use, not investment advice.")
+
+# ============================================================
+# SIDEBAR — INPUTS
+# ============================================================
+with st.sidebar:
+    st.header("Universe")
+    market_type = st.selectbox("Market Type", ["Crypto", "Stock"])
+    default_syms = "BTCUSDT, ETHUSDT, SOLUSDT" if market_type == "Crypto" else "AAPL, MSFT, SPY"
+    raw_symbols = st.text_area("Tickers (comma-separated)", value=default_syms, height=70)
+    symbols = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
+
+    st.header("Window")
+    start_date = st.date_input("Start Date", pd.to_datetime("2018-01-01"))
+    end_date = st.date_input("End Date", pd.to_datetime("today"))
+
+    st.header("Risk Settings")
+    vol_threshold = st.slider("Stress Volatility Threshold (annualized %)", 5.0, 150.0, 40.0, 1.0)
+    rf_rate = st.number_input("Risk-free rate (annual %, for Sharpe)", value=4.5, step=0.25) / 100
+    var_conf = st.selectbox("VaR/CVaR Confidence", ["95%", "99%"], index=0)
+    rolling_window = st.slider("Rolling Volatility Window (days)", 10, 90, 21)
+
+TRADING_DAYS = 365 if market_type == "Crypto" else 252
+
+# ============================================================
+# DATA FETCHING
+# ============================================================
+@st.cache_data(show_spinner="Fetching data...")
+def fetch_crypto(symbol, start, end):
+    """Paginated Binance klines fetch — handles ranges >1000 candles."""
+    url = "https://api.binance.com/api/v3/klines"
+    clean_symbol = symbol.replace("/", "").upper()
+    start_ts = int(pd.Timestamp(start).timestamp() * 1000)
+    end_ts = int(pd.Timestamp(end).timestamp() * 1000)
+
+    all_rows = []
+    cursor = start_ts
+    while cursor < end_ts:
+        resp = requests.get(url, params={
+            "symbol": clean_symbol, "interval": "1d",
+            "startTime": cursor, "endTime": end_ts, "limit": 1000
+        }, timeout=10)
+        data = resp.json()
+        if not data or isinstance(data, dict):
+            break
+        all_rows.extend(data)
+        last_open_time = data[-1][0]
+        if last_open_time <= cursor:
+            break
+        cursor = last_open_time + 1
+        if len(data) < 1000:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_rows, columns=[
+        "Open Time", "O", "H", "L", "Close", "V", "CT", "QA", "NT", "TB", "TQ", "I"
+    ])
+    df["Date"] = pd.to_datetime(df["Open Time"], unit="ms")
+    df.set_index("Date", inplace=True)
+    df = df[["Close"]].astype(float)
+    return df[~df.index.duplicated(keep="first")]
+
+
+@st.cache_data(show_spinner="Fetching data...")
+def fetch_stock(symbol, start, end):
+    raw = yf.download(symbol, start=start, end=end, progress=False)
+    if raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        df = raw[["Close"]].copy()
+        df.columns = df.columns.get_level_values(0)
+    else:
+        df = raw[["Close"]].copy()
+    return df
+
+
+def fetch_series(symbol, market_type, start, end):
+    try:
+        if market_type == "Crypto":
+            return fetch_crypto(symbol, start, end)
+        return fetch_stock(symbol, start, end)
+    except Exception as e:
+        st.warning(f"{symbol}: fetch error — {e}")
+        return pd.DataFrame()
+
+
+if not symbols:
+    st.info("Enter at least one ticker in the sidebar.")
+    st.stop()
+
+price_data = {}
+for sym in symbols:
+    df = fetch_series(sym, market_type, start_date, end_date)
+    if df is not None and not df.empty:
+        price_data[sym] = df["Close"]
+    else:
+        st.warning(f"No data returned for {sym} — skipped.")
+
+if not price_data:
+    st.error("Could not retrieve data for any ticker. Check symbols and try again.")
+    st.stop()
+
+prices = pd.DataFrame(price_data).sort_index().ffill().dropna(how="all")
+returns = prices.pct_change().dropna(how="all")
+
+# ============================================================
+# RISK METRICS ENGINE
+# ============================================================
+z_scores = {"95%": 1.645, "99%": 2.326}
+z = z_scores[var_conf]
+conf_level = 0.95 if var_conf == "95%" else 0.99
+
+def compute_metrics(ret_series: pd.Series) -> dict:
+    ret_series = ret_series.dropna()
+    if len(ret_series) < 5:
+        return {}
+
+    ann_return = ret_series.mean() * TRADING_DAYS
+    ann_vol = ret_series.std() * np.sqrt(TRADING_DAYS)
+    sharpe = (ann_return - rf_rate) / ann_vol if ann_vol > 0 else np.nan
+
+    downside = ret_series[ret_series < 0]
+    downside_vol = downside.std() * np.sqrt(TRADING_DAYS) if len(downside) > 1 else np.nan
+    sortino = (ann_return - rf_rate) / downside_vol if downside_vol and downside_vol > 0 else np.nan
+
+    cum = (1 + ret_series).cumprod()
+    running_max = cum.cummax()
+    drawdown = cum / running_max - 1
+    max_dd = drawdown.min()
+
+    # Historical (non-parametric) VaR / CVaR on daily returns
+    var_hist = np.percentile(ret_series, (1 - conf_level) * 100)
+    cvar_hist = ret_series[ret_series <= var_hist].mean()
+
+    return {
+        "Ann. Return %": ann_return * 100,
+        "Ann. Volatility %": ann_vol * 100,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "Max Drawdown %": max_dd * 100,
+        f"VaR {var_conf} (daily) %": var_hist * 100,
+        f"CVaR {var_conf} (daily) %": cvar_hist * 100,
+        "Skew": ret_series.skew(),
+        "Excess Kurtosis": ret_series.kurtosis(),
+    }
+
+metrics_table = pd.DataFrame({sym: compute_metrics(returns[sym]) for sym in prices.columns}).T
+
+# ============================================================
+# TOP-LINE METRICS
+# ============================================================
+st.subheader("Risk Summary")
+n_cols = min(len(prices.columns), 4)
+cols = st.columns(n_cols)
+for i, sym in enumerate(prices.columns):
+    with cols[i % n_cols]:
+        row = metrics_table.loc[sym]
+        st.metric(
+            label=sym,
+            value=f"Sharpe {row['Sharpe']:.2f}",
+            delta=f"MaxDD {row['Max Drawdown %']:.1f}%",
+            delta_color="inverse",
+        )
+
+st.dataframe(metrics_table.style.format("{:.2f}"), use_container_width=True)
+
+# ============================================================
+# ROLLING VOLATILITY REGIME
+# ============================================================
+st.subheader(f"Rolling {rolling_window}-Day Annualized Volatility (Regime View)")
+rolling_vol = returns.rolling(rolling_window).std() * np.sqrt(TRADING_DAYS) * 100
+
+fig_vol = go.Figure()
+for sym in rolling_vol.columns:
+    fig_vol.add_trace(go.Scatter(x=rolling_vol.index, y=rolling_vol[sym], name=sym, mode="lines"))
+fig_vol.add_hline(y=vol_threshold, line_dash="dash", line_color="#ef4444",
+                   annotation_text="Stress threshold", annotation_position="top left")
+fig_vol.update_layout(template="plotly_dark", height=420,
+                       yaxis_title="Annualized Volatility (%)", legend_title="Asset")
+st.plotly_chart(fig_vol, use_container_width=True)
+
+# ============================================================
+# DRAWDOWN
+# ============================================================
+st.subheader("Drawdown from Peak")
+fig_dd = go.Figure()
+for sym in prices.columns:
+    cum = (1 + returns[sym].fillna(0)).cumprod()
+    dd = cum / cum.cummax() - 1
+    fig_dd.add_trace(go.Scatter(x=dd.index, y=dd * 100, name=sym, fill="tozeroy", mode="lines"))
+fig_dd.update_layout(template="plotly_dark", height=380, yaxis_title="Drawdown (%)")
+st.plotly_chart(fig_dd, use_container_width=True)
+
+# ============================================================
+# CORRELATION MATRIX — the actual portfolio-level lens
+# ============================================================
+if len(prices.columns) > 1:
+    st.subheader("Cross-Asset Correlation (Daily Returns)")
+    corr = returns.corr()
+    fig_corr = px.imshow(
+        corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+        aspect="auto",
+    )
+    fig_corr.update_layout(template="plotly_dark", height=450)
+    st.plotly_chart(fig_corr, use_container_width=True)
+    st.caption("Diversification check: correlations near +1 mean limited diversification benefit; "
+               "near -1 means the pair tends to hedge each other.")
+
+# ============================================================
+# MONTHLY STABILITY / TURBULENCE TABLE (kept, per-asset, comparable)
+# ============================================================
+st.subheader("Most Stable & Most Turbulent Month — Per Asset")
+
+def monthly_stats_for(sym):
+    r = returns[sym].dropna()
+    if r.empty:
+        return pd.DataFrame()
+    df = r.to_frame("ret")
+    df["Year"] = df.index.year
+    df["Month"] = df.index.month
+    vol = df.groupby(["Year", "Month"])["ret"].std().reset_index(name="Volatility")
+    vol["Volatility"] *= np.sqrt(TRADING_DAYS) * 100  # annualized, comparable to chart above
+    close = prices[sym]
+    chg = close.groupby([close.index.year, close.index.month]).apply(
+        lambda x: (x.iloc[-1] - x.iloc[0]) / x.iloc[0] * 100 if len(x) > 1 else np.nan
+    )
+    chg.index = pd.MultiIndex.from_tuples(chg.index, names=["Year", "Month"])
+    vol = vol.set_index(["Year", "Month"])
+    vol["Monthly Change %"] = chg
+    vol["Asset"] = sym
+    return vol.reset_index()
+
+all_monthly = pd.concat([monthly_stats_for(s) for s in prices.columns], ignore_index=True)
+if not all_monthly.empty:
+    stable = all_monthly.loc[all_monthly.groupby(["Asset", "Year"])["Volatility"].idxmin()]
+    turbulent = all_monthly.loc[all_monthly.groupby(["Asset", "Year"])["Volatility"].idxmax()]
+
+    tab1, tab2 = st.tabs(["Most Stable", "Most Turbulent"])
+    with tab1:
+        st.dataframe(stable.sort_values(["Asset", "Year"], ascending=[True, False]),
+                     use_container_width=True, hide_index=True)
+    with tab2:
+        st.dataframe(turbulent.sort_values(["Asset", "Year"], ascending=[True, False]),
+                     use_container_width=True, hide_index=True)
+
+st.divider()
+st.caption(
+    "Methodology: historical (non-parametric) VaR/CVaR on daily returns; Sharpe/Sortino annualized "
+    f"using {TRADING_DAYS} trading days/yr and a {rf_rate*100:.2f}% risk-free rate. "
+    "Not investment advice — for research and signal-development use only."
+)
